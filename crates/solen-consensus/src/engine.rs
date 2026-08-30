@@ -2116,7 +2116,19 @@ impl ConsensusEngine {
                 .unwrap_or(usize::MAX);
             let better = match best {
                 None => true,
-                Some((_, bstake, brank)) => stake > bstake || (stake == bstake && rank < brank),
+                // Total order: stake, then proposer rank, then block hash. The final
+                // hash tiebreak is REQUIRED — without it, two candidates with equal
+                // stake AND equal rank (e.g. the same proposer's empty vs. non-empty
+                // variant of one height) are ordered only by HashMap iteration order,
+                // which is randomized per process, so different nodes elect different
+                // leaders and consensus livelocks (mainnet halt 2026-08-29, block
+                // 1513793). Hash is deterministic and identical fleet-wide, so this
+                // makes leader selection converge.
+                Some((bhash, bstake, brank)) => {
+                    stake > bstake
+                        || (stake == bstake && rank < brank)
+                        || (stake == bstake && rank == brank && *hash < bhash)
+                }
             };
             if better {
                 best = Some((*hash, stake, rank));
@@ -4970,5 +4982,80 @@ mod tests {
             real_root,
             "restore must not mutate a clean restored store"
         );
+    }
+
+    /// Regression (mainnet halt 2026-08-29, block 1513793): v2_leader must be a
+    /// TOTAL order. Two candidates at one height from the SAME proposer (same rank)
+    /// with EQUAL stake — the empty vs. non-empty variant a proposer emits when a
+    /// gapped-nonce tx is included then dropped — were previously ordered only by
+    /// HashMap iteration order (randomized per process), so different nodes elected
+    /// different leaders and consensus livelocked. The hash tiebreak makes the
+    /// winner deterministic (min hash) fleet-wide. Rebuilding the tally HashMap each
+    /// iteration varies its order; the elected leader must be identical every time.
+    #[test]
+    fn v2_leader_is_deterministic_on_equal_stake_same_rank_ties() {
+        let kps: Vec<Keypair> = (0..5).map(|_| Keypair::generate()).collect();
+        let ids: Vec<[u8; 32]> = kps.iter().map(|k| k.public_key()).collect();
+        let vs = ValidatorSet::new(ids.iter().map(|id| ValidatorInfo::new(*id, 100)).collect());
+        let config = EngineConfig {
+            validator_id: ids[0],
+            fork_choice_v2_height: 0,
+            ..Default::default()
+        };
+        let engine = ConsensusEngine::with_validators(
+            config,
+            Box::new(MemoryStore::new()),
+            Mempool::new(1000),
+            vs,
+        );
+
+        // Two variants of height 1 from the SAME proposer (ids[0]) -> same rank,
+        // different transactions_root -> different block hashes (A0 vs A1).
+        let h = 1u64;
+        let mk = |troot: [u8; 32]| BlockHeader {
+            height: h,
+            epoch: 0,
+            parent_hash: [0u8; 32],
+            state_root: [7u8; 32],
+            transactions_root: troot,
+            receipts_root: [0u8; 32],
+            proposer: ids[0],
+            timestamp_ms: 1000,
+            proposer_signature: vec![],
+        };
+        let hdr_a = mk([0u8; 32]);
+        let hdr_b = mk([1u8; 32]);
+        let ha = block_hash(&hdr_a);
+        let hb = block_hash(&hdr_b);
+        assert_ne!(ha, hb);
+        let pb = |header: BlockHeader| PendingBlock {
+            header,
+            operations: vec![],
+            proposed_at: std::time::Instant::now(),
+            already_executed: false,
+            result: None,
+            revert: None,
+            mismatch_count: 0,
+        };
+        {
+            let mut v2 = engine.v2_blocks.write().unwrap();
+            let e = v2.entry(h).or_default();
+            e.insert(ha, pb(hdr_a));
+            e.insert(hb, pb(hdr_b));
+        }
+        let expected = std::cmp::min(ha, hb);
+
+        // Equal stake (2 distinct voters each = 200 vs 200), same rank (same
+        // proposer). Only the hash tiebreak can decide -> always the min hash.
+        for _ in 0..64 {
+            let mut tally: HashMap<Hash, Vec<ValidatorId>> = HashMap::new();
+            tally.insert(ha, vec![ids[1], ids[2]]);
+            tally.insert(hb, vec![ids[3], ids[4]]);
+            assert_eq!(
+                engine.v2_leader(h, &tally),
+                Some(expected),
+                "v2_leader must deterministically elect the min-hash candidate on an equal-stake, same-rank tie"
+            );
+        }
     }
 }
